@@ -1,0 +1,231 @@
+Fix- protocol
+
+System requirements
+Windows 10/11, 64-bit
+8 GB RAM is comfortable, and about 10 GB free disk (the Build Tools are large and vcpkg builds from source)
+Internet access for the downloads
+
+Step 1: Install tools
+
+Visual Studio 2022 Build Tools (or Community). Select the workload “Desktop development with C++”. This also includes CMake.
+Git for Windows.
+
+Step 2: Install QuickFIX with vcpkg
+
+Open PowerShell:
+
+powershell
+git clone https://github.com/microsoft/vcpkg C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+C:\vcpkg\vcpkg install quickfix:x64-windows
+
+This takes a few minutes while it builds.
+
+Step 3: Create the project
+powershell
+mkdir C:\fix-proto\spec
+cd C:\fix-proto
+curl -o spec\FIX44.xml https://raw.githubusercontent.com/quickfix/quickfix/master/spec/FIX44.xml
+
+That XML file is the FIX 4.4 data dictionary, which QuickFIX uses to validate messages.
+
+CMakeLists.txt
+
+cmake_minimum_required(VERSION 3.20)
+project(fix_proto CXX)
+set(CMAKE_CXX_STANDARD 17)
+
+find_package(quickfix CONFIG REQUIRED)
+
+add_executable(acceptor acceptor.cpp)
+target_link_libraries(acceptor PRIVATE quickfix)
+
+add_executable(initiator initiator.cpp)
+target_link_libraries(initiator PRIVATE quickfix)
+
+
+acceptor.cfg
+
+[DEFAULT]
+ConnectionType=acceptor
+SocketAcceptPort=5001
+StartTime=00:00:00
+EndTime=00:00:00
+UseDataDictionary=Y
+DataDictionary=spec/FIX44.xml
+FileStorePath=store_exec
+FileLogPath=log_exec
+
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=EXEC
+TargetCompID=CLIENT
+
+
+initiator.cfg
+
+[DEFAULT]
+ConnectionType=initiator
+SocketConnectHost=127.0.0.1
+SocketConnectPort=5001
+HeartBtInt=30
+ReconnectInterval=5
+StartTime=00:00:00
+EndTime=00:00:00
+UseDataDictionary=Y
+DataDictionary=spec/FIX44.xml
+FileStorePath=store_client
+FileLogPath=log_client
+
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=CLIENT
+TargetCompID=EXEC
+
+acceptor.cpp
+
+#include "quickfix/Application.h"
+#include "quickfix/MessageCracker.h"
+#include "quickfix/FileStore.h"
+#include "quickfix/FileLog.h"
+#include "quickfix/SocketAcceptor.h"
+#include "quickfix/SessionSettings.h"
+#include "quickfix/fix44/NewOrderSingle.h"
+
+#include "quickfix/fix44/ExecutionReport.h"
+#include <iostream>
+#include <string>
+
+class ExecApp : public FIX::Application, public FIX::MessageCracker {
+    int id_ = 0;
+public:
+    void onCreate(const FIX::SessionID&) override {}
+    void onLogon(const FIX::SessionID& s) override { std::cout << "Logon: " << s << "\n"; }
+    void onLogout(const FIX::SessionID& s) override { std::cout << "Logout: " << s << "\n"; }
+    void toAdmin(FIX::Message&, const FIX::SessionID&) override {}
+    void fromAdmin(const FIX::Message&, const FIX::SessionID&) override {}
+    void toApp(FIX::Message&, const FIX::SessionID&) override {}
+    void fromApp(const FIX::Message& m, const FIX::SessionID& s) override { crack(m, s); }
+
+    void onMessage(const FIX44::NewOrderSingle& o, const FIX::SessionID& s) override {
+        FIX::ClOrdID clOrdID; FIX::Symbol symbol; FIX::Side side;
+        FIX::OrderQty qty; FIX::Price price(0);
+        o.get(clOrdID); o.get(symbol); o.get(side); o.get(qty);
+        if (o.isSetField(FIX::FIELD::Price)) o.get(price);
+
+        std::cout << "Order received: " << o.toString() << "\n";
+
+        FIX44::ExecutionReport er(
+            FIX::OrderID(std::to_string(++id_)),
+            FIX::ExecID(std::to_string(id_)),
+            FIX::ExecType(FIX::ExecType_TRADE),
+            FIX::OrdStatus(FIX::OrdStatus_FILLED),
+            side, FIX::LeavesQty(0), FIX::CumQty(qty), FIX::AvgPx(price));
+        er.set(clOrdID);
+        er.set(symbol);
+        er.set(qty);
+        er.set(FIX::LastQty(qty));
+        er.set(FIX::LastPx(price));
+        FIX::Session::sendToTarget(er, s);
+    }
+};
+
+int main(int argc, char** argv) {
+    try {
+        FIX::SessionSettings settings(argc > 1 ? argv[1] : "acceptor.cfg");
+        ExecApp app;
+        FIX::FileStoreFactory store(settings);
+        FIX::FileLogFactory log(settings);
+        FIX::SocketAcceptor acceptor(app, store, log, settings);
+        acceptor.start();
+        std::cout << "Acceptor running. Press Enter to quit.\n";
+        std::cin.get();
+        acceptor.stop();
+    } catch (std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return 1;
+    }
+}
+
+
+initiator.cpp
+
+#include "quickfix/Application.h"
+#include "quickfix/MessageCracker.h"
+#include "quickfix/FileStore.h"
+#include "quickfix/FileLog.h"
+#include "quickfix/SocketInitiator.h"
+#include "quickfix/SessionSettings.h"
+#include "quickfix/fix44/NewOrderSingle.h"
+#include "quickfix/fix44/ExecutionReport.h"
+#include <iostream>
+#include <algorithm>
+
+static std::string pretty(std::string s) {
+    std::replace(s.begin(), s.end(), '\x01', '|');
+    return s;
+}
+
+class ClientApp : public FIX::Application, public FIX::MessageCracker {
+public:
+    void onCreate(const FIX::SessionID&) override {}
+    void onLogout(const FIX::SessionID& s) override { std::cout << "Logout: " << s << "\n"; }
+    void toAdmin(FIX::Message&, const FIX::SessionID&) override {}
+    void fromAdmin(const FIX::Message&, const FIX::SessionID&) override {}
+    void toApp(FIX::Message&, const FIX::SessionID&) override {}
+    void fromApp(const FIX::Message& m, const FIX::SessionID& s) override { crack(m, s); }
+
+    void onLogon(const FIX::SessionID& s) override {
+        std::cout << "Logon: " << s << "\n";
+        FIX44::NewOrderSingle order(
+            FIX::ClOrdID("ORD1"),
+            FIX::Side(FIX::Side_BUY),
+            FIX::TransactTime(),
+            FIX::OrdType(FIX::OrdType_LIMIT));
+        order.set(FIX::Symbol("AAPL"));
+        order.set(FIX::OrderQty(100));
+        order.set(FIX::Price(150.50));
+        order.set(FIX::TimeInForce(FIX::TimeInForce_DAY));
+        FIX::Session::sendToTarget(order, s);
+        std::cout << "Sent: " << pretty(order.toString()) << "\n";
+    }
+
+    void onMessage(const FIX44::ExecutionReport& er, const FIX::SessionID&) override {
+        std::cout << "ExecutionReport: " << pretty(er.toString()) << "\n";
+    }
+};
+
+int main(int argc, char** argv) {
+    try {
+        FIX::SessionSettings settings(argc > 1 ? argv[1] : "initiator.cfg");
+        ClientApp app;
+        FIX::FileStoreFactory store(settings);
+        FIX::FileLogFactory log(settings);
+        FIX::SocketInitiator initiator(app, store, log, settings);
+        initiator.start();
+        std::cout << "Initiator running. Press Enter to quit.\n";
+        std::cin.get();
+        initiator.stop();
+    } catch (std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return 1;
+    }
+}
+
+
+Step 4: Build.
+
+cd C:\fix-proto
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
+
+
+Step 5: Run
+
+window 1 
+
+build\Release\acceptor.exe
+
+window 2
+
+build\Release\initiator.exe
